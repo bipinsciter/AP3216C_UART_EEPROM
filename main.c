@@ -58,8 +58,13 @@
 
 /* Private typedef ****************************************************************************************************/
 #define AVG_SAMPLE 10
-#define RELAY_CONFIRM_CNT 7
-
+#define RELAY_CONFIRM_ON_CNT 5
+#define RELAY_CONFIRM_OFF_CNT 5
+#define UART_DIS_TIME_SEC 600
+#define CALL_PRESS_TIME_SEC 5
+#define EMERGENCY_SENSE_SEC 15
+#define EMERGENCY_AUTO_RESTORE_SEC 120
+#define EMERGENCY_FORCE_RESTORE_SEC 5
 
 /* Private define *****************************************************************************************************/
 
@@ -67,12 +72,13 @@
 
 /* Private variables **************************************************************************************************/
 //uint8_t gu8_counter=0;
-uint16_t ps=0, final_ps=0, threshold=0;
+uint16_t ps=0, final_ps=0, last_final_ps=0, threshold=0;
 uint16_t raw_cnt[AVG_SAMPLE]={0};
 uint32_t gu32_temp=0,raw_cnt_avg=0;
-bool relayMsgOn=0,relayMsgOff=0;
-uint8_t raw_cnt_ind=0, i=0, RelayOnCnt=0, RelayOffCnt=0;
-uint16_t UartDisableTimer=300;
+bool relayMsgOn=0,relayMsgOff=0,emergencyTriggered=0;
+uint8_t raw_cnt_ind=0, i=0, RelayOnCnt=0, RelayOffCnt=0,CalPressTimer=CALL_PRESS_TIME_SEC,test_cnt=0;
+uint8_t emergencySenseTimer=0,emergencyRestoreTimer=0,emergencyForceRestoreTryTimer=0,emergencyForceRestoreTry=0;
+uint16_t UartDisableTimer=UART_DIS_TIME_SEC;
 
 
 #define FLASH_PAGE_NUMBER                   (16)
@@ -145,6 +151,8 @@ int main(void)
 	printf("Threshold=%d\n",threshold);
 	TIM1_Configure();
 	
+	last_final_ps = final_ps = ap3216c_read_proximity();
+	
     while(1)
     {
 		//---------------------------------------------------------------------------------
@@ -161,13 +169,13 @@ int main(void)
 			}
 			final_ps = raw_cnt_avg/AVG_SAMPLE;
 			
-			//if(!RelayDeadTimer)
-			{
-				if(final_ps>threshold)  //Change count here for sensing        
+			if(abs(last_final_ps-final_ps)<10)
+			{	
+				if(final_ps>threshold)        
 				{
 					RelayOffCnt=0;
-					if(RelayOnCnt<RELAY_CONFIRM_CNT)RelayOnCnt++;
-					if(RelayOnCnt>=RELAY_CONFIRM_CNT)
+					if(RelayOnCnt<RELAY_CONFIRM_ON_CNT)RelayOnCnt++;
+					if(RelayOnCnt>=RELAY_CONFIRM_ON_CNT)
 					{
 						relayMsgOff=0;
 						if(!relayMsgOn)
@@ -176,22 +184,55 @@ int main(void)
 							if(UartDisableTimer) printf("RELAY ON\n");
 							relayMsgOn=1;
 						}
+						
+						if(emergencyForceRestoreTry!=2)
+						{
+							emergencyForceRestoreTry=2;
+							if(UartDisableTimer) printf("emergencyForceRestoreTry=%d\n",emergencyForceRestoreTry);
+						}
 					}
 				}
 				else
 				{
 					RelayOnCnt=0;
-					if(RelayOffCnt<RELAY_CONFIRM_CNT)RelayOffCnt++;
-					if(RelayOffCnt>=RELAY_CONFIRM_CNT)
+					
+					if(emergencyTriggered) 
 					{
-						relayMsgOn=0;
-						if(!relayMsgOff)
+						if(emergencyForceRestoreTry!=1)
 						{
-							RELAY_OFF;
-							if(UartDisableTimer) printf("RELAY OFF\n");
-							relayMsgOff=1;
+							emergencyForceRestoreTry=1;
+							if(UartDisableTimer) printf("emergencyForceRestoreTry=%d\n",emergencyForceRestoreTry);
 						}
 					}
+					else
+					{
+						emergencySenseTimer=0;
+						
+						if(RelayOffCnt<RELAY_CONFIRM_OFF_CNT)RelayOffCnt++;
+						if(RelayOffCnt>=RELAY_CONFIRM_OFF_CNT)
+						{
+							relayMsgOn=0;
+							if(!relayMsgOff)
+							{
+								RELAY_OFF;
+								if(UartDisableTimer) printf("RELAY OFF\n");
+								relayMsgOff=1;
+							}
+						}
+					}
+				}
+				
+				last_final_ps = final_ps;
+				test_cnt=0;
+			}
+			else
+			{
+				test_cnt++;
+				if(test_cnt>2)
+				{
+					test_cnt=0;
+					
+					last_final_ps = final_ps;
 				}
 			}
 			
@@ -206,8 +247,7 @@ int main(void)
 			}
 			
 			bool_msec50_flag=0;
-		}
-		
+		}	
 		//---------------------------------------------------------------------------------	
 		if(bool_sec_flag)
 		{
@@ -216,12 +256,93 @@ int main(void)
 				UartDisableTimer--;
 				if(!UartDisableTimer)
 				{
+					printf("UART Disabled\n");
+					
 					//Disable UART
 					USART_Cmd(USART1, DISABLE);
 				}
 			}
 			
+			if(relayMsgOn)
+			{
+				if(!emergencyTriggered)
+				{
+					if(emergencySenseTimer<EMERGENCY_SENSE_SEC)emergencySenseTimer++;
+					if(emergencySenseTimer>=EMERGENCY_SENSE_SEC)
+					{
+						emergencySenseTimer=0;
+						emergencyTriggered=1;
+						emergencyRestoreTimer=EMERGENCY_AUTO_RESTORE_SEC;
+						
+						if(UartDisableTimer) printf("Emergency Triggered\n");
+					}
+				}
+				else
+				{
+					if(emergencyForceRestoreTry==2)
+					{
+						emergencyForceRestoreTryTimer++;
+						if(emergencyForceRestoreTryTimer>EMERGENCY_FORCE_RESTORE_SEC)
+						{
+							emergencyForceRestoreTryTimer=0;
+							
+							emergencyTriggered=0;
+							emergencyForceRestoreTry=0;
+							if(UartDisableTimer) printf("Emergency Force Restored\n");
+							
+							RELAY_OFF;
+							PLATFORM_DelayMS(1000);
+							RELAY_ON;
+						}
+					}
+					else
+					{
+						emergencyForceRestoreTryTimer=0;
+					}
+					
+					if(emergencyRestoreTimer)
+					{
+						emergencyRestoreTimer--;
+						if(!emergencyRestoreTimer)
+						{
+							emergencyTriggered=0;
+							emergencyForceRestoreTry=0;
+							if(UartDisableTimer) printf("Emergency Timeout Restored\n");
+							
+							RELAY_OFF;
+							PLATFORM_DelayMS(1000);
+							RELAY_ON;
+						}
+					}
+				}
+			}
 			
+			if(!CAL_PIN_STAT)
+			{
+				if(CalPressTimer) 
+				{	
+					CalPressTimer--;
+					if(!CalPressTimer)
+					{
+						//Erase Flash Page
+						FLASH_SimulateEEPROM_ErasePage(FLASH_SimulateEEPROM_PAGE_START);
+						
+						gu32_temp=final_ps;
+						threshold=final_ps;
+						
+						//Write Threshold Data
+						FLASH_SimulateEEPROM_ProgramWord(FLASH_SimulateEEPROM_PAGE_START, gu32_temp);
+						
+						//Reply with Acknowledgement message
+						printf("Threshold=%d Saved\n",final_ps);
+					}
+				}
+			}
+			else
+			{
+				CalPressTimer=CALL_PRESS_TIME_SEC;
+			}
+						
 			if(UartDisableTimer) printf("Count=%d\r\n",final_ps);
 			
 			bool_sec_flag=0;
